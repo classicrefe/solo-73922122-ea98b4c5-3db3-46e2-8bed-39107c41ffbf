@@ -41,3 +41,12 @@ STAGE_PARSE = "parse"
 STAGE_VALIDATE = "validate"
 STAGE_PUBLISH = "publish"
 STAGE_DONE = "done"
+
+# ---- Optical-duplicate check -------------------------------------------------
+# The check runs synchronously inside the request, so it must stay well inside
+# the 256 MiB process cap for its documented worst case: 50,000 read pairs with
+# up to 500 bases per end.
+OPTICAL_MAX_PAIRS = int(os.environ.get("FASTQ_OPTICAL_MAX_PAIRS", 50_000))
+OPTICAL_MAX_READ_LENGTH = int(os.environ.get("FASTQ_OPTICAL_MAX_READ_LENGTH", 500))
+OPTICAL_MIN_DISTANCE = 1
+OPTICAL_MAX_DISTANCE = 10

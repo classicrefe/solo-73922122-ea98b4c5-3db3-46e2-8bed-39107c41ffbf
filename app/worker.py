@@ -211,6 +211,8 @@ def recover_on_startup() -> dict[str, int]:
         ids = db.non_terminal_task_ids(conn)
         for task_id in ids:
             db.delete_records(conn, task_id)
+            # Optical reports referenced results that are gone with the task.
+            db.delete_optical_checks_for_task(conn, task_id)
             db.update_task(
                 conn,
                 task_id,

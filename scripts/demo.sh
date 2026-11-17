@@ -102,6 +102,31 @@ sleep 2
 curl -fsS "$BASE_URL/tasks/$CANCEL_ID"
 echo
 
+echo "== optical duplicate check (ids look like INST:RUN:FC:LANE:TILE:X:Y) =="
+OPT_R1="$WORK/opt_R1.fastq"; OPT_R2="$WORK/opt_R2.fastq"
+OPT_IDS='INST:1:FC:1:100:100:100 INST:1:FC:1:100:102:101 INST:1:FC:1:100:900:900'
+for rid in $OPT_IDS; do
+  qual=$( [ "$rid" = "INST:1:FC:1:100:102:101" ] && printf 'J%.0s' $(seq 40) || printf 'I%.0s' $(seq 40) )
+  seq1=$(printf 'ACGT%.0s' $(seq 10))
+  printf '@%s/1\n%s\n+\n%s\n' "$rid" "$seq1" "$qual" >> "$OPT_R1"
+  printf '@%s/2\n%s\n+\n%s\n' "$rid" "$seq1" "$qual" >> "$OPT_R2"
+done
+OPT=$(curl -fsS -X POST "$BASE_URL/tasks" \
+  -F "r1=@$OPT_R1;filename=opt_R1.fastq" \
+  -F "r2=@$OPT_R2;filename=opt_R2.fastq")
+OPT_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$OPT")
+sleep 1
+CHECK=$(curl -fsS -X POST "$BASE_URL/optical-checks" \
+  -H 'Content-Type: application/json' \
+  -d "{\"task_id\": \"$OPT_ID\", \"distance_threshold\": 3}")
+echo "$CHECK"
+python3 -c 'import json,sys; b=json.load(sys.stdin); assert b["state"]=="ready" and b["total_pairs"]==3 and b["duplicate_pairs"]==1, b; print("duplicates:", b["duplicates"])' <<<"$CHECK"
+
+echo "== a successful task with non-optical ids is rejected as a whole =="
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/optical-checks" \
+  -H 'Content-Type: application/json' \
+  -d "{\"task_id\": \"$ID\", \"distance_threshold\": 2}"
+
 echo "== cancelling the already succeeded task -> HTTP 409 =="
 curl -s -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/tasks/$ID/cancel"
 

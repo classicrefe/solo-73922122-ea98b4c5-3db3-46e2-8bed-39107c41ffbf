@@ -85,6 +85,7 @@ def init_db() -> None:
         conn = connect()
         try:
             conn.executescript(SCHEMA)
+            conn.executescript(OPTICAL_SCHEMA)
         finally:
             conn.close()
         _initialized = True
@@ -211,3 +212,73 @@ def non_terminal_task_ids(conn: sqlite3.Connection) -> list[str]:
             "SELECT id FROM tasks WHERE status NOT IN ('succeeded','failed','cancelled')"
         )
     ]
+
+
+OPTICAL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS optical_checks (
+    id              TEXT PRIMARY KEY,
+    task_id         TEXT NOT NULL,
+    threshold       INTEGER NOT NULL,
+    state           TEXT NOT NULL,   -- running | ready | failed
+    error           TEXT NOT NULL DEFAULT '',
+    total_pairs     INTEGER NOT NULL DEFAULT 0,
+    duplicate_pairs INTEGER NOT NULL DEFAULT 0,
+    report          TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+"""
+
+
+def create_optical_check(
+    conn: sqlite3.Connection, check_id: str, task_id: str, threshold: int
+) -> None:
+    now = utcnow()
+    conn.execute(
+        "INSERT INTO optical_checks (id, task_id, threshold, state, created_at, "
+        "updated_at) VALUES (?, ?, ?, 'running', ?, ?)",
+        (check_id, task_id, threshold, now, now),
+    )
+
+
+def get_optical_check(
+    conn: sqlite3.Connection, check_id: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM optical_checks WHERE id = ?", (check_id,)
+    ).fetchone()
+
+
+def finish_optical_check(
+    conn: sqlite3.Connection,
+    check_id: str,
+    *,
+    state: str,
+    error: str = "",
+    total_pairs: int = 0,
+    duplicate_pairs: int = 0,
+    report: str = "",
+) -> None:
+    conn.execute(
+        "UPDATE optical_checks SET state = ?, error = ?, total_pairs = ?, "
+        "duplicate_pairs = ?, report = ?, updated_at = ? WHERE id = ?",
+        (state, error, total_pairs, duplicate_pairs, report, utcnow(), check_id),
+    )
+
+
+def delete_optical_checks_for_task(
+    conn: sqlite3.Connection, task_id: str
+) -> None:
+    conn.execute("DELETE FROM optical_checks WHERE task_id = ?", (task_id,))
+
+
+def abort_stale_optical_checks(conn: sqlite3.Connection) -> int:
+    """A fresh process cannot have a check in progress: mark them failed."""
+    cur = conn.execute(
+        "UPDATE optical_checks SET state = 'failed', "
+        "error = 'interrupted by service restart', updated_at = ? "
+        "WHERE state = 'running'",
+        (utcnow(),),
+    )
+    return cur.rowcount
+

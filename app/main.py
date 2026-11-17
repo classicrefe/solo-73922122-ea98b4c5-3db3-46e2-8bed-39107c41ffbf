@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from . import config, db, worker
+from . import config, db, optical, worker
 from .worker import UploadTooLarge, start_worker, task_dir
 
 
@@ -20,16 +22,23 @@ from .worker import UploadTooLarge, start_worker, task_dir
 async def lifespan(_: FastAPI):
     db.init_db()
     worker.recover_on_startup()
+    conn = db.connect()
+    try:
+        db.abort_stale_optical_checks(conn)
+    finally:
+        conn.close()
     yield
 
 
 app = FastAPI(
     title="Paired FASTQ Service",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Upload shuffled paired-end FASTQ files (R1/R2, uncompressed, "
         "max 256 MiB each). The service re-pairs them by read id, delivers "
-        "both mates in R1 order and preserves the original bytes."
+        "both mates in R1 order and preserves the original bytes. "
+        "It also exposes an optical-duplicate check over the results of a "
+        "successful task."
     ),
     lifespan=lifespan,
 )
@@ -232,3 +241,208 @@ def download_r2(task_id: str) -> FileResponse:
 @app.get("/health")
 def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
+# Optical-duplicate check
+# ---------------------------------------------------------------------------
+
+
+class OpticalCheckRequest(BaseModel):
+    task_id: str = Field(
+        ...,
+        description="Id of a successful re-pairing task.",
+        examples=["0f3a...c9"],
+    )
+    distance_threshold: int = Field(
+        ...,
+        ge=config.OPTICAL_MIN_DISTANCE,
+        le=config.OPTICAL_MAX_DISTANCE,
+        description="Maximum Euclidean pixel distance (1..10) for a link.",
+        examples=[2],
+    )
+
+
+class OpticalDuplicate(BaseModel):
+    read_id: str = Field(..., description="Read id to remove.")
+    keep_read_id: str = Field(..., description="Read id whose pair is kept.")
+
+
+class OpticalCheckOut(BaseModel):
+    id: str
+    task_id: str
+    state: str = Field(..., description="ready or failed.")
+    distance_threshold: int
+    total_pairs: int = Field(..., description="Read pairs examined.")
+    duplicate_pairs: int = Field(..., description="Pairs flagged for removal.")
+    duplicates: list[OpticalDuplicate] = Field(
+        default_factory=list,
+        description="Flagged pairs in R1 order, each with its retained pair.",
+    )
+    error: str = ""
+    created_at: str
+    updated_at: str
+
+
+def _serialize_optical(row: sqlite3.Row) -> OpticalCheckOut:
+    duplicates: list[OpticalDuplicate] = []
+    if row["state"] == "ready" and row["report"]:
+        body = json.loads(row["report"])
+        duplicates = [OpticalDuplicate(**item) for item in body]
+    return OpticalCheckOut(
+        id=row["id"],
+        task_id=row["task_id"],
+        state=row["state"],
+        distance_threshold=row["threshold"],
+        total_pairs=row["total_pairs"],
+        duplicate_pairs=row["duplicate_pairs"],
+        duplicates=duplicates,
+        error=row["error"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _result_file_or_409(task_id: str, side: int) -> Path:
+    """Locate a published result file, refusing anything not fully succeeded.
+
+    This deliberately re-checks the database *and* the filesystem so a task
+    whose results were removed or truncated externally fails the whole check
+    instead of yielding a partial list.
+    """
+    conn = db.connect()
+    try:
+        row = db.get_task(conn, task_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        if row["status"] != "succeeded":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"task is {row['status']}; only a successful re-pairing "
+                    "task can be checked"
+                ),
+            )
+        rel = row["result_r1"] if side == 1 else row["result_r2"]
+        if not rel:
+            raise HTTPException(
+                status_code=409, detail="result files are missing for this task"
+            )
+    finally:
+        conn.close()
+    base = task_dir(task_id).resolve()
+    path = (base / rel).resolve()
+    if base not in path.parents or not path.is_file():
+        raise HTTPException(
+            status_code=409, detail=f"result R{side} file is missing"
+        )
+    return path
+
+
+_optical_slot = threading.Lock()
+"""One check at a time keeps the process inside its 256 MiB cap."""
+
+
+def _run_optical_check(
+    check_id: str, r1_path: Path, r2_path: Path, threshold: int
+) -> sqlite3.Row:
+    """Analyse, persist the outcome and return the stored report row."""
+    try:
+        result = optical.analyze(r1_path, r2_path, threshold)
+    except (optical.OpticalCheckError, OSError) as exc:
+        conn = db.connect()
+        try:
+            db.finish_optical_check(
+                conn, check_id, state="failed", error=str(exc)
+            )
+        finally:
+            conn.close()
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": f"optical check failed as a whole: {exc}",
+                "check_id": check_id,
+            },
+        ) from exc
+
+    conn = db.connect()
+    try:
+        db.finish_optical_check(
+            conn,
+            check_id,
+            state="ready",
+            total_pairs=result["total_pairs"],
+            duplicate_pairs=result["duplicate_pairs"],
+            report=json.dumps(result["duplicates"], separators=(",", ":")),
+        )
+        row = db.get_optical_check(conn, check_id)
+    finally:
+        conn.close()
+    return row
+
+
+@app.post(
+    "/optical-checks",
+    response_model=OpticalCheckOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Detect optical duplicates in a successful task's results",
+)
+def create_optical_check(body: OpticalCheckRequest) -> OpticalCheckOut:
+    """Run the whole check synchronously and return the complete report.
+
+    Any missing file, corrupt record, invalid coordinate or quality byte
+    outside ASCII 33..126 fails the entire check; no partial list is returned
+    and the result files are never modified.  Only one check runs at a time so
+    the process stays inside its 256 MiB cap.
+    """
+    r1_path = _result_file_or_409(body.task_id, 1)
+    r2_path = _result_file_or_409(body.task_id, 2)
+
+    check_id = uuid.uuid4().hex
+    conn = db.connect()
+    try:
+        db.create_optical_check(conn, check_id, body.task_id, body.distance_threshold)
+    finally:
+        conn.close()
+
+    # Only one check runs at a time.  A 50,000-pair worst case plus the API
+    # process baseline stays under 256 MiB; two concurrent checks would not.
+    if not _optical_slot.acquire(blocking=False):
+        conn = db.connect()
+        try:
+            db.finish_optical_check(
+                conn, check_id, state="failed",
+                error="another optical check is already running",
+            )
+        finally:
+            conn.close()
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": "another optical check is already running; retry later",
+                "check_id": check_id,
+            },
+        )
+    try:
+        row = _run_optical_check(
+            check_id, r1_path, r2_path, body.distance_threshold
+        )
+    finally:
+        _optical_slot.release()
+    return _serialize_optical(row)
+
+
+@app.get(
+    "/optical-checks/{check_id}",
+    response_model=OpticalCheckOut,
+    summary="Fetch a previously produced optical-duplicate report",
+)
+def get_optical_check(check_id: str) -> OpticalCheckOut:
+    conn = db.connect()
+    try:
+        row = db.get_optical_check(conn, check_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="optical check not found")
+        return _serialize_optical(row)
+    finally:
+        conn.close()
